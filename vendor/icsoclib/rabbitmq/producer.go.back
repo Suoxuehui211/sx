@@ -1,0 +1,302 @@
+package rabbitmq
+
+import (
+	"fmt"
+	"net"
+	"time"
+
+	"icsoclib/mq"
+
+	log "github.com/alecthomas/log4go"
+	"github.com/streadway/amqp"
+)
+
+//Msg is a node that rabbitmq producer deal with
+type Msg struct {
+	Topic   string //queue name
+	Message []byte //message body
+}
+
+//Producer repsents a rabbitmq broker
+type Producer struct {
+	uri              string //rabbitmq server url
+	exchangeName     string
+	exchangeType     string
+	conn             *amqp.Connection       //amqp connection
+	ch               *amqp.Channel          //amqp sending channel
+	chConfirm        chan amqp.Confirmation //chan confirm mode use
+	chmsg            chan *Msg              //buffer hold Msgs
+	chanBufferSize   int                    //buffer size
+	done             chan struct{}
+	chError          chan *amqp.Error
+	chReturn 			chan amqp.Return
+	heartBeatSeconds int
+	sendTimeout      time.Duration
+	persistent			bool
+	deliveryMode	uint8
+}
+
+// ProducerOption sets a parameter for the Producer
+type ProducerOption func(c *Producer)
+
+//ProducerHeartBeat set heartbeat
+func ProducerHeartBeat(d int) ProducerOption {
+	return func(c *Producer) {
+		if d > 0 {
+			c.heartBeatSeconds = d
+		}
+	}
+}
+
+//Buffer set send buffer size
+func Buffer(chanBufferSize int) ProducerOption {
+	return func(c *Producer) {
+		if chanBufferSize > 0 {
+			c.chanBufferSize = chanBufferSize
+		}
+	}
+}
+
+//Channel set a custome channel for sending
+func Channel(ch chan *Msg) ProducerOption {
+	return func(c *Producer) {
+		if ch != nil {
+			if c.chmsg != nil {
+				close(c.chmsg)
+			}
+			c.chmsg = ch
+		}
+	}
+}
+
+//SendTimeout set whether send blocked
+func SendTimeout(timeout time.Duration) ProducerOption {
+	return func(c *Producer) {
+		if timeout > 0 {
+			c.sendTimeout = timeout
+		}
+	}
+}
+
+//PersistentDelivery set whether persistent delivery
+//Publishing messages as persistent affects performance
+func PersistentDelivery(p bool) ProducerOption {
+	return func(c *Producer) {
+		c.persistent = p
+	}
+}
+
+//NewRabbitmqProducer get a new Producer object
+//url:	rabbitmq url: "amqp://guest:guest@192.168.96.6:5672/im"
+//exchangeName:	exchange name
+//exchangeType:	exchange type, ie: "topic", "fanout"
+//chanBufferSize: send chan size
+//return value:
+func NewRabbitmqProducer(url, exchangeName, exchangeType string, opts ...ProducerOption) mq.IProducerWithMultiTopic {
+	r := &Producer{
+		uri:              url,
+		exchangeName:     exchangeName,
+		exchangeType:     exchangeType,
+		chanBufferSize:   10240,
+		chmsg:            make(chan *Msg, 10240),
+		done:             make(chan struct{}),
+		heartBeatSeconds: 60,
+		persistent:	true,
+	}
+
+	for _, option := range opts {
+		option(r)
+	}
+	if r.persistent{
+		r.deliveryMode = amqp.Persistent
+	}else{
+		r.deliveryMode = amqp.Transient
+	}
+	return r
+}
+
+//Publish produce message
+//topic: no use here, for compatible with mq.IProducerWithMultiTopic
+//key:	rabbitmq topic mode, topic name
+//value:	a message
+//return value:
+func (r *Producer) Publish(topic, key string, value []byte) error {
+	msg := Msg{key, value}
+	if time.Duration(r.sendTimeout) == 0 {
+		select {
+		case r.chmsg <- &msg:
+		case <-r.done:
+			return nil
+		}
+	} else {
+		select {
+		case r.chmsg <- &msg:
+		case <-time.After(r.sendTimeout):
+			err := fmt.Errorf("send buffer chan full, throw value, routingkey: %s, value: %s", key, string(value))
+			return err
+		case <-r.done:
+			return nil
+		}
+	}
+	return nil
+}
+
+func (r *Producer) connect() error {
+	log.Warn("start")
+	var err error
+	r.conn, err = amqp.DialConfig(r.uri, amqp.Config{
+		Heartbeat: time.Duration(r.heartBeatSeconds) * time.Second,
+		Dial: func(network, addr string) (net.Conn, error) {
+			return net.DialTimeout(network, addr, 3*time.Second)
+		},
+	})
+	if err != nil {
+		log.Error(err)
+		return err
+	}
+
+	r.ch, err = r.conn.Channel()
+	if err != nil {
+		log.Error("Channel: %s", err)
+		return err
+	}
+
+	if err = r.ch.ExchangeDeclare(
+		r.exchangeName, // name
+		r.exchangeType, // type
+		true,           // durable
+		false,          // auto-deleted
+		false,          // internal
+		false,          // noWait
+		nil,            // arguments
+	); err != nil {
+		log.Error(err)
+		return err
+	}
+
+	if r.chError = r.ch.NotifyClose(make(chan *amqp.Error)); r.chError != nil {
+		log.Error(err)
+		return err
+	}
+
+	if r.chReturn = r.ch.NotifyReturn(make(chan amqp.Return)); r.chReturn != nil {
+		log.Error(err)
+		return err
+	}
+
+	// Reliable publisher confirms require confirm.select support from the connection.
+	if err = r.ch.Confirm(false); err != nil {
+		log.Error(err)
+		return err
+	}
+	r.chConfirm = r.ch.NotifyPublish(make(chan amqp.Confirmation, 1))
+	go r.confirm(r.chConfirm)
+	log.Warn("connected rabbitmq, url: %s, exchangeType (%s) exchangeName (%s)", r.uri, r.exchangeType, r.exchangeName)
+	return nil
+}
+
+func (r *Producer) shutdown() {
+	if r.conn != nil {
+		r.conn.Close()
+		r.conn = nil
+	}
+	time.Sleep(time.Millisecond * 100)
+}
+
+// Close exit producer
+func (r *Producer) Close() error {
+	r.done <- struct{}{}
+	return nil
+}
+
+//implement publish a single message
+func (r *Producer) publishImpl(topic string, message []byte) error {
+	if r == nil || r.ch == nil {
+		log.Debug("Producer/channel nil")
+		return nil
+	}
+
+	if err := r.ch.Publish(
+		r.exchangeName, // publish to an exchange
+		topic,          // routing to 0 or more queues
+		false,          // mandatory
+		false,          // immediate
+		amqp.Publishing{
+			//			Headers:         amqp.Table{},
+			ContentType: "text/plain",
+			//			ContentEncoding: "",
+			DeliveryMode: r.deliveryMode,
+			Body: message,
+			//			DeliveryMode:    amqp.Transient, // 1=non-persistent, 2=persistent
+			//			Priority:        0,              // 0-9
+		},
+	); err != nil {
+		log.Error("send to %s, message: %s, error:%s", topic, string(message), err.Error())
+		return err
+	}
+	return nil
+}
+
+//Process send message to rabbitmq server
+func (r *Producer) Process() error {
+	log.Debug("Process start")
+	defer log.Debug("Process end")
+
+	pending := make(chan *Msg, 64)
+	defer close(pending)
+
+	for {
+		r.shutdown()
+		if err := r.connect(); err != nil {
+			log.Error(err)
+			continue
+		}
+
+	publish:
+		for {
+			select {
+			case msg := <-pending:
+				if err := r.publishImpl(msg.Topic, msg.Message); err != nil {
+					log.Error(err)
+					break publish
+				} else {
+					log.Debug("tx topic: %s, message: %s", msg.Topic, string(msg.Message))
+				}
+			case msg := <-r.chmsg:
+				if err := r.publishImpl(msg.Topic, msg.Message); err != nil {
+					select {
+					case pending <- msg:
+					default:
+						log.Error("drop message, topic: %s, message: %s", msg.Topic, string(msg.Message))
+					}
+					log.Error(err)
+					break publish
+				} else {
+					log.Debug("tx topic: %s, message: %s", msg.Topic, string(msg.Message))
+				}
+			case err := <-r.chError:
+				log.Error(err.Error())
+				break publish
+			case <-r.done:
+				log.Debug("done, exit Process")
+				return nil
+			}
+		}
+
+	}
+}
+
+func (r *Producer) confirm(confirms chan amqp.Confirmation) {
+	for {
+		confirmed, open := <-confirms
+		if open {
+			if !confirmed.Ack {
+				log.Error("failed delivery of delivery tag: %d", confirmed.DeliveryTag)
+			}
+		} else {
+			log.Debug("confirm goroutine exit")
+			return
+		}
+
+	}
+}
